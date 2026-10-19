@@ -1,0 +1,155 @@
+name: Sepolia receipt (path B, real SNIP-36 proof)
+
+# Proves PaymentReceipt.prove_payment with the snip36 local prover (~15 GB RAM) on a GitHub runner,
+# registers the commitment on Sepolia with the proof attached, then verifies it from the opening alone.
+# Path B uses StarkWare's PUBLIC reference note (channel key 0xdef) in a MockPool, so the prover input
+# holds no secret. Never run a real channel key through a hosted runner.
+#
+# Repo secrets (a Sepolia TEST account only): STARKNET_ACCOUNT_ADDRESS, STARKNET_PRIVATE_KEY.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pool:
+        description: MockPool address (Sepolia)
+        default: "0x50692e08999c48c41ec09d73d56213f9cce016199e32541590a966635d8b333"
+      receipt:
+        description: PaymentReceipt address (deployed against the MockPool)
+        default: "0x7e38ced4058d815fcabc776ef7e2880ae4b5b61bf01fd37f60fc5ec8409d227"
+      claim:
+        description: "exact:<amount> or atLeast:<amount> (the note holds 1000)"
+        default: "atLeast:900"
+      reference:
+        description: Payment reference
+        default: "INV-TEST-1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sepolia-receipt
+  cancel-in-progress: false
+
+jobs:
+  prove-register-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      SNIP36_TAG: v1.2.5
+      STARKNET_CHAIN_ID: SN_SEPOLIA
+      # Reads, submission and verification.
+      STARKNET_RPC_URL: https://starknet-sepolia-rpc.publicnode.com
+      # The prover needs storage proofs at the base block; this endpoint keeps ~128 recent blocks.
+      PROVE_RPC_URL: https://api.zan.top/public/starknet-sepolia/rpc/v0_10
+      STARKNET_ACCOUNT_ADDRESS: ${{ secrets.STARKNET_ACCOUNT_ADDRESS }}
+      STARKNET_PRIVATE_KEY: ${{ secrets.STARKNET_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check secrets
+        run: |
+          test -n "$STARKNET_ACCOUNT_ADDRESS" || { echo "::error::secret STARKNET_ACCOUNT_ADDRESS missing"; exit 1; }
+          test -n "$STARKNET_PRIVATE_KEY" || { echo "::error::secret STARKNET_PRIVATE_KEY missing"; exit 1; }
+
+      - name: Extra swap (headroom for the prover)
+        run: |
+          sudo fallocate -l 16G /extra-swap && sudo chmod 600 /extra-swap
+          sudo mkswap /extra-swap && sudo swapon /extra-swap
+          free -h
+
+      - name: Install snip36 and the prebuilt prover stack
+        run: |
+          curl -fsSL "https://github.com/starknet-innovation/snip-36-prover-backend/releases/download/${SNIP36_TAG}/install.sh" | sh -s -- "$SNIP36_TAG"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          git clone --quiet --depth 1 --branch "$SNIP36_TAG" https://github.com/starknet-innovation/snip-36-prover-backend "$HOME/snip36"
+          cd "$HOME/snip36" && snip36 setup --prebuilt && snip36 doctor
+          echo "SNIP36_PROJECT_DIR=$HOME/snip36" >> "$GITHUB_ENV"
+
+      - name: Client
+        working-directory: client
+        run: |
+          npm ci
+          npm test
+
+      - name: Env file
+        run: |
+          umask 077
+          {
+            echo "STARKNET_CHAIN_ID=$STARKNET_CHAIN_ID"
+            echo "STARKNET_RPC_URL=$STARKNET_RPC_URL"
+            echo "STARKNET_ACCOUNT_ADDRESS=$STARKNET_ACCOUNT_ADDRESS"
+            echo "STARKNET_PRIVATE_KEY=$STARKNET_PRIVATE_KEY"
+            echo "POOL=${{ inputs.pool }}"
+            echo "RECEIPT_CONTRACT=${{ inputs.receipt }}"
+          } > .env
+
+      - name: Build the virtual tx and prove it (local snip36 prover)
+        working-directory: client
+        run: |
+          command -v /usr/bin/time >/dev/null || sudo apt-get install -y -qq time
+          npx tsx scripts/00-mock-note.ts
+          npx tsx scripts/03-make-virtual-tx.ts --note private-note.json --claim "${{ inputs.claim }}" --reference "${{ inputs.reference }}"
+          BASE=$(node -e 'console.log(require("./out/meta.json").base_block)')
+          /usr/bin/time -v snip36 prove virtual-os --block-number "$BASE" --tx-json out/receipt_tx.json \
+            --rpc-url "$PROVE_RPC_URL" --output out/receipt.proof 2> >(tee out/prove-time.txt >&2)
+          ls -la out
+
+      - name: Register the receipt on Sepolia (proof-carrying invoke)
+        working-directory: client
+        run: |
+          npx tsx scripts/04-register-receipt.ts
+          npx tsx scripts/04-register-receipt.ts --send | tee out/register.txt
+
+      - name: Verify from the opening alone (no key, storage proof)
+        working-directory: client
+        run: |
+          npx tsx scripts/05-verify.ts --opening out/opening.json --rpc "$STARKNET_RPC_URL" | tee out/verify.txt
+
+      - name: Tamper check (edited claim must fail)
+        working-directory: client
+        run: |
+          node -e 'const f=require("fs");const o=JSON.parse(f.readFileSync("out/opening.json"));o.claim.value="901";f.writeFileSync("out/opening-tampered.json",JSON.stringify(o,null,2))'
+          if npx tsx scripts/05-verify.ts --opening out/opening-tampered.json --rpc "$STARKNET_RPC_URL" > out/tamper.txt 2>&1; then
+            echo "::error::tampered opening verified"; cat out/tamper.txt; exit 1
+          fi
+          grep -q "opening does not match" out/tamper.txt && echo "OK  tampered opening rejected: opening does not match"
+
+      - name: Summary
+        if: always()
+        working-directory: client
+        run: |
+          {
+            echo "## STRK20 receipt on Sepolia"
+            echo '```'
+            cat out/meta.json 2>/dev/null
+            grep -E "Maximum resident|Elapsed" out/prove-time.txt 2>/dev/null
+            cat out/register.txt out/verify.txt 2>/dev/null
+            echo '```'
+            tx=$(grep -o 'Submitted: 0x[0-9a-f]*' out/register.txt 2>/dev/null | cut -d' ' -f2)
+            [ -n "$tx" ] && echo "register_receipt tx: https://sepolia.voyager.online/tx/$tx"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload proof and opening
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: receipt-${{ github.run_id }}
+          path: |
+            client/out/opening.json
+            client/out/meta.json
+            client/out/receipt.proof
+            client/out/receipt.proof_facts
+            client/out/receipt.raw_messages.json
+            client/out/register.txt
+            client/out/verify.txt
+            client/out/tamper.txt
+          if-no-files-found: ignore

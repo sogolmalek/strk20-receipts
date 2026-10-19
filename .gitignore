@@ -1,0 +1,7 @@
+node_modules/
+contracts/target/
+.env
+out/
+private-note.json
+*.proof
+*.proof_facts

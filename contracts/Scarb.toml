@@ -1,0 +1,26 @@
+[package]
+name = "payment_receipt"
+version = "0.1.0"
+edition = "2024_07"
+license = "Apache-2.0"
+description = "Payment-scoped STRK20 receipts proven with SNIP-36 virtual blocks"
+
+[dependencies]
+starknet = "2.17.0"
+# STRK20 privacy pool (interfaces + the real Privacy contract for tests), pinned.
+privacy = { git = "https://github.com/starkware-libs/starknet-privacy", rev = "caab04dc990aca75f190c8b9f97c60dd0e4f1b28" }
+
+[dev-dependencies]
+snforge_std = "0.63.0"
+assert_macros = "2.17.0"
+
+[[target.starknet-contract]]
+sierra = true
+casm = true
+build-external-contracts = ["privacy::privacy::Privacy"]
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
+
+[scripts]
+test = "snforge test"
